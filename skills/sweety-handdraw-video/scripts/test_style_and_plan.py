@@ -166,6 +166,35 @@ class StyleAndPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'disconnected'):
             validate_strokes({'segments':invalid})
 
+    def test_smoothed_strokes_stay_on_the_ink(self):
+        mask = np.zeros((40, 40), dtype=bool)
+        mask[6:10, 6:30] = True
+        mask[6:30, 6:10] = True
+        paths = stroke_assets.ordered_paths(mask)
+        self.assertTrue(any(np.abs(path - np.rint(path)).max() > 0.05 for path in paths))
+        for path in paths:
+            coordinates = np.rint(path).astype(int)
+            self.assertTrue(mask[coordinates[:, 1], coordinates[:, 0]].all())
+            self.assertLessEqual(np.linalg.norm(np.diff(path, axis=0), axis=1).max(), 1.5)
+
+    def test_thin_bridge_draws_one_side_before_the_other(self):
+        mask = np.zeros((80, 180), dtype=bool)
+        mask[10:60, 8:40] = True
+        mask[10:60, 140:172] = True
+        mask[34:36, 40:140] = True
+        paths = stroke_assets.ordered_paths(mask)
+        sides = []
+        for path in paths:
+            center = path[:, 0].mean()
+            sides.append('L' if center < 50 else 'R' if center > 120 else 'B')
+        left = [index for index, side in enumerate(sides) if side == 'L']
+        right = [index for index, side in enumerate(sides) if side == 'R']
+        self.assertTrue(left and right)
+        self.assertLess(max(left), min(right))
+        for path in paths:
+            coordinates = np.rint(path).astype(int)
+            self.assertTrue(mask[coordinates[:, 1], coordinates[:, 0]].all())
+
     def test_shared_endpoint_still_has_a_lift(self):
         paths=[np.array([[0.,0.],[1.,0.]]),np.array([[1.,0.],[1.,1.]])]
         _,segments=stroke_assets.time_paths(paths,(3,3))
