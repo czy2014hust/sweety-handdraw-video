@@ -34,6 +34,68 @@ def lengths(points):
     return stroke_utils.calculate_lengths(points)
 
 
+def _on_mask(path, mask):
+    coordinates = np.rint(np.asarray(path, dtype=float)).astype(int)
+    height, width = mask.shape
+    if len(coordinates) < 2 or (coordinates[:, 0] < 0).any() or (coordinates[:, 1] < 0).any():
+        return False
+    if (coordinates[:, 0] >= width).any() or (coordinates[:, 1] >= height).any():
+        return False
+    return bool(mask[coordinates[:, 1], coordinates[:, 0]].all())
+
+
+def _smooth_on_mask(path, mask):
+    smoothed = stroke_utils.smooth_stroke(path)
+    if _on_mask(smoothed, mask):
+        return smoothed
+    return np.asarray(path, dtype=float)
+
+
+def _bridge_pieces(mask):
+    """Split thin bridges, then fold specks into the nearest large piece."""
+    labels, count = ndimage.label(mask, structure=np.ones((3, 3)))
+    pieces = []
+    for label in range(1, count + 1):
+        ys, xs = np.where(labels == label)
+        for piece_y, piece_x in stroke_utils.split_bridge_points(ys, xs):
+            piece = np.zeros(mask.shape, dtype=bool)
+            piece[piece_y, piece_x] = True
+            pieces.append(piece)
+    if len(pieces) < 2:
+        return pieces
+    threshold = max(3, int(mask.sum() * 0.005))
+    areas = [int(piece.sum()) for piece in pieces]
+    large = [index for index, area in enumerate(areas) if area > threshold]
+    small = [index for index, area in enumerate(areas) if area <= threshold]
+    if not large or not small:
+        return pieces
+    centroids = []
+    for index in large:
+        ys, xs = np.where(pieces[index])
+        centroids.append((float(ys.mean()), float(xs.mean())))
+    merged = [pieces[index].copy() for index in large]
+    for index in small:
+        ys, xs = np.where(pieces[index])
+        center = (float(ys.mean()), float(xs.mean()))
+        nearest = min(range(len(large)), key=lambda item: (centroids[item][0] - center[0]) ** 2 + (centroids[item][1] - center[1]) ** 2)
+        merged[nearest] |= pieces[index]
+    return merged
+
+
+def _piece_index(path, pieces):
+    coordinates = np.rint(path).astype(int)
+    hits = [int(piece[coordinates[:, 1], coordinates[:, 0]].sum()) for piece in pieces]
+    best = int(np.argmax(hits))
+    if hits[best]:
+        return best
+    center = path.mean(axis=0)
+    centroids = []
+    for piece in pieces:
+        ys, xs = np.where(piece)
+        centroids.append((float(xs.mean()), float(ys.mean())) if len(xs) else (float(center[0]), float(center[1])))
+    return min(range(len(pieces)), key=lambda item: (centroids[item][0] - center[0]) ** 2 + (centroids[item][1] - center[1]) ** 2)
+
+
 def ordered_paths(mask):
     skeleton = stroke_utils.thin_ink(mask)
     paths = [np.array(path) for path in stroke_utils.trace_strokes(skeleton)]
@@ -82,8 +144,14 @@ def ordered_paths(mask):
             coordinates = np.rint(extension).astype(int)
         paths.append(extension)
         covered[coordinates[:,1],coordinates[:,0]] = True
+    paths = [_smooth_on_mask(path, mask) for path in paths]
     oriented = [path if tuple(path[0][::-1]) <= tuple(path[-1][::-1]) else path[::-1] for path in paths]
-    return sorted(oriented,key=lambda path:(round(path[:,1].min()/16),path[:,0].min()))
+    pieces = _bridge_pieces(mask)
+    if len(pieces) < 2:
+        return sorted(oriented, key=lambda path: (round(path[:, 1].min() / 16), path[:, 0].min()))
+    order = sorted(range(len(pieces)), key=lambda index: (int(np.where(pieces[index])[0].min()) // 16, int(np.where(pieces[index])[1].min())))
+    rank = {index: position for position, index in enumerate(order)}
+    return sorted(oriented, key=lambda path: (rank[_piece_index(path, pieces)], round(path[:, 1].min() / 16), path[:, 0].min()))
 
 
 def time_paths(paths, shape, start=0., duration=1.):

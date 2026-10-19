@@ -78,7 +78,7 @@
 
 跨多句的一个完整画面可以使用页面 `visual_groups`，每组为 `{"start_beat":0,"end_beat":2,"lead":0.54,"hold":0.72,"actions":[...]}`，索引从0开始。此时 beats 中的 actions 可以为空或省略。起止索引必须有序且在该页范围内，lead 非负，hold 至少0.45秒；多个组不能造成主笔事件重叠。不要给每句机械安排一幅新图。一个画面讲多句时，按句拆成多个动作并用 `from_beat` 让每个动作随它那句起笔，不要让一个动作铺满整组。
 
-生产任务必须使用 `narration.source/alignment` 指定完整旁白母带和对应时间戳，字段见[连续旁白约定](continuous-narration.md)。`audio.end_hold_seconds` 只控制整篇声音结束后的画面停留；生产任务拒绝非零 `sentence_pause_seconds/page_pause_seconds`、`pace` 非1和 `trim_silence:true`。绘制窗口太短则简化画面或合并绘制窗口，不能截短呼吸、插入空白或拉慢旁白来容纳画面。封面只接受1秒，前半秒静止、后半秒渐隐，正文和旁白从1秒后开始。
+生产任务必须使用 `narration.source/alignment` 指定完整旁白母带和对应时间戳，字段见[连续旁白约定](continuous-narration.md)。已有逐字一致的 SRT 时用 `scripts/import_srt.py` 写入 alignment，时间取字幕轴，不按字数分配。`audio.end_hold_seconds` 只控制整篇声音结束后的画面停留；生产任务拒绝非零 `sentence_pause_seconds/page_pause_seconds`、`pace` 非1和 `trim_silence:true`。绘制窗口太短则简化画面或合并绘制窗口，不能截短呼吸、插入空白或拉慢旁白来容纳画面。封面只接受1秒，前半秒静止、后半秒渐隐，正文和旁白从1秒后开始。
 
 ## 镜头与转场
 
