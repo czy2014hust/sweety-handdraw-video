@@ -34,7 +34,7 @@ class ImportSrtTests(unittest.TestCase):
                     'narration': {'source': 'master.wav', 'alignment': 'alignment.json'},
                     'audio': {'end_hold_seconds': 0.45}}
         (root / 'job.json').write_text(json.dumps(manifest))
-        self.assertEqual(import_srt(root, root / 'captions.srt'), root / 'alignment.json')
+        self.assertEqual(import_srt(root, root / 'captions.srt'), (root / 'alignment.json').resolve())
         _, loaded, _ = load_master(root, manifest, root / 'converted.wav')
         self.assertEqual(loaded['b']['start'], 1.2)
         temporary.cleanup()
