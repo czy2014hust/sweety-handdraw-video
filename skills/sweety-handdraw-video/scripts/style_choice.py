@@ -1,18 +1,25 @@
-"""Snapshot the exact hand-drawn catalog, show an image picker, validate its decision."""
+"""Snapshot the hand-drawn catalog as a text list, validate style decisions. No preview wall."""
 import argparse
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
 import secrets
+import shutil
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlsplit
 from PIL import Image
+from hosted_assets import fetch, resolve_asset
 
 PACKAGE = Path(__file__).resolve().parents[1]
+# Bundled styles with clean ink outlines and flat color are drawn stroke by stroke; styles without outlines
+# (watercolor, gouache, paper cut, pixel, ink wash, crayon, painterly, 3D) are revealed by the brush instead.
+DRAWN_STYLES = {'1', '4', '5', '17', '19', '20'}
+MONOCHROME_STYLES = {'1'}  # pure black ink on paper: the picture is never coloured
 MODE_LABELS = {
-    'catalog_auto': '不主动选择，由模型自动匹配',
+    'catalog_auto': '不主动选择，由模型自动匹配（优先逐笔绘制、上色的画风）',
     'inferred': '不选择列表中的，模型推理产出',
     'custom': '自定义描述风格',
 }
@@ -22,7 +29,8 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def prepare_catalog(job, source):
+def prepare_catalog(job, source, require_previews=False):
+    """Build style/catalog.json from STYLES.md. Previews are best-effort and unused by native menus."""
     job, source = Path(job).resolve(), Path(source).resolve()
     directory = job / 'style'
     directory.mkdir(parents=True, exist_ok=True)
@@ -33,7 +41,9 @@ def prepare_catalog(job, source):
     manifest_path = source / 'assets/image-manifest.json'
     remote_images = json.loads(manifest_path.read_text())['images'] if manifest_path.exists() else {}
     fallback = PACKAGE / 'assets/style-previews'
-    hosted_previews = {item['id']: item for item in json.loads((fallback/'manifest.json').read_text())['images']}
+    hosted_previews = {}
+    if (fallback / 'manifest.json').is_file():
+        hosted_previews = {item['id']: item for item in json.loads((fallback / 'manifest.json').read_text())['images']}
     catalog = []
     for index, match in enumerate(matches):
         identity, name = match.groups()
@@ -43,27 +53,66 @@ def prepare_catalog(job, source):
         candidates = list((source / 'examples').glob(identity.zfill(2) + '-*.png')) if '.' not in identity else []
         candidates += list((source / ('assets/style-' + identity)).glob('anchor-*.png'))
         preview_path = directory / 'previews' / (identity + '.jpg')
-        if candidates:
-            image = Image.open(candidates[0]).convert('RGB')
-            image.thumbnail((720, 720))
-            image.save(preview_path, quality=87)
-            preview = 'previews/' + preview_path.name
-        elif identity in hosted_previews and source == (PACKAGE/'dependencies/hand-drawn-styles').resolve():
-            preview = hosted_previews[identity]['url']
-        else:
-            keys = [key for key in remote_images if key.startswith('examples/' + identity.zfill(2) + '-')]
-            keys += [key for key in remote_images if key.startswith('assets/style-' + identity + '/anchor-')]
-            if not keys:
-                raise ValueError('No real preview for style ' + identity)
-            preview = remote_images[keys[0]]['url']
-        catalog.append({'id': identity, 'name': name, 'preview': preview,
-                        'recipe': 'recipes/' + recipe_path.name, 'recipe_sha256': digest(recipe_path)})
+        preview = None
+        try:
+            if candidates:
+                image = Image.open(candidates[0]).convert('RGB')
+                image.thumbnail((720, 720))
+                image.save(preview_path, quality=87)
+                preview = 'previews/' + preview_path.name
+            elif identity in hosted_previews and source == (PACKAGE / 'dependencies/hand-drawn-styles').resolve():
+                shutil.copyfile(resolve_asset(fallback / hosted_previews[identity]['thumbnail']), preview_path)
+                preview = 'previews/' + preview_path.name
+            else:
+                keys = [key for key in remote_images if key.startswith('examples/' + identity.zfill(2) + '-')]
+                keys += [key for key in remote_images if key.startswith('assets/style-' + identity + '/anchor-')]
+                if keys:
+                    record = remote_images[keys[0]]
+                    urls = [record['url']] + ([record['fallback_url']] if record.get('fallback_url') else [])
+                    content = fetch(keys[0], {**record, 'urls': urls}, source / keys[0])
+                    image = Image.open(io.BytesIO(content)).convert('RGB')
+                    image.thumbnail((720, 720))
+                    image.save(preview_path, quality=87)
+                    preview = 'previews/' + preview_path.name
+                elif require_previews:
+                    raise ValueError('No real preview for style ' + identity)
+        except (OSError, ValueError, KeyError):
+            if require_previews:
+                raise
+            preview = None
+        bundled = source == (PACKAGE / 'dependencies/hand-drawn-styles').resolve()
+        entry = {'id': identity, 'name': name, 'preview': preview,
+                 'recipe': 'recipes/' + recipe_path.name, 'recipe_sha256': digest(recipe_path)}
+        if bundled:
+            entry.update(drawing_mode='draw' if identity in DRAWN_STYLES else 'reveal',
+                         monochrome=identity in MONOCHROME_STYLES)
+        catalog.append(entry)
     if not catalog:
         raise ValueError('No numbered styles in the selected STYLES.md')
     catalog.sort(key=lambda entry: tuple(int(part) for part in entry['id'].split('.')))
     snapshot = {'source': str(source), 'styles_sha256': digest(source / 'STYLES.md'), 'styles': catalog}
     (directory / 'catalog.json').write_text(json.dumps(snapshot, ensure_ascii=False, indent=2))
     return snapshot
+
+
+def text_style_menu(catalog, as_records=False):
+    """Default option is model inference; numbered styles are soft hints, not constraints."""
+    styles = catalog['styles'] if isinstance(catalog, dict) else catalog
+    if as_records:
+        rows = [{'id': 'inferred', 'label': '模型推理（默认）', 'hint': '按主题与内容自动选；列表不约束模型'}]
+        for entry in styles:
+            mode = entry.get('drawing_mode', '')
+            tag = ' · 逐笔' if mode == 'draw' else (' · 揭示' if mode == 'reveal' else '')
+            rows.append({'id': entry['id'], 'label': entry['name'], 'drawing_mode': mode, 'tag': tag})
+        rows.append({'id': 'custom', 'label': '自定义描述', 'hint': '用户一句话'})
+        return rows
+    lines = ['0) 模型推理（默认）— 按主题与内容自动选；下列风格仅为可选项，不约束模型']
+    for index, entry in enumerate(styles, 1):
+        mode = entry.get('drawing_mode', '')
+        tag = ' [逐笔]' if mode == 'draw' else (' [揭示]' if mode == 'reveal' else '')
+        lines.append(f"{index}) {entry['id']}  {entry['name']}{tag}")
+    lines.append(f"{len(styles) + 1}) 自定义描述")
+    return lines
 
 
 def validate_selection(selection, catalog):
@@ -99,6 +148,7 @@ def verify_style(job):
     specification = resolved.get('style_spec', {})
     if any(not specification.get(key) for key in ('line', 'palette', 'shading', 'texture', 'background')):
         raise ValueError('Style specification needs line, palette, shading, texture and background')
+    expected, monochrome = None, False
     if selection['mode'] in ('catalog', 'catalog_auto'):
         identity = resolved.get('catalog_id')
         entry = next((entry for entry in catalog['styles'] if entry['id'] == identity), None)
@@ -108,13 +158,30 @@ def verify_style(job):
             raise ValueError('The model must not replace the selected numbered style')
         if selection['mode'] == 'catalog_auto' and not resolved.get('content_fit'):
             raise ValueError('Automatic catalog matching needs a content-fit explanation')
+        expected = entry.get('drawing_mode')
+        monochrome = entry.get('monochrome', False)
     elif resolved.get('catalog_id') or resolved.get('recipe_sha256') or resolved.get('catalog_recipe'):
         raise ValueError('Inferred/custom styles must be independent of hand-drawn recipes')
     if selection['mode'] == 'inferred' and not resolved.get('content_fit'):
         raise ValueError('An inferred style needs a content-based rationale')
     if selection['mode'] == 'custom' and resolved.get('style_basis') != selection['user_description']:
         raise ValueError('Custom style must be based on the exact user description')
-    return {'mode': selection['mode'], 'name': resolved['style_name'], 'resolved_sha256': digest(resolved_path)}
+    drawing_mode = resolved.get('drawing_mode', expected)
+    if drawing_mode not in ('draw', 'reveal') or (expected and drawing_mode != expected):
+        raise ValueError('style/resolved.json needs drawing_mode: "draw" only for clean ink outlines with flat color, otherwise "reveal"; '
+                         'catalog styles keep the catalog value' + (f' ("{expected}")' if expected else ''))
+    # Reveal brushes the finished image in region by region: it gives up drawing, so only the user can trade drawing
+    # for a look. Clicking a card the picker labels "揭示" is that choice; any other route needs the user's own answer.
+    informed_pick = selection['mode'] == 'catalog' and selection['confirmation'] == 'user_dialog'
+    if drawing_mode == 'reveal' and not informed_pick and not str(resolved.get('reveal_accepted', '')).strip():
+        raise ValueError('Reveal replaces stroke-by-stroke drawing, so only the user may choose it. Resolve a drawable version of '
+                         'this look (clean continuous ink outlines, flat colour) with drawing_mode "draw"; or tell the user that '
+                         'this look can only be brushed in, not drawn, and record their answer in resolved.json reveal_accepted')
+    model_chosen = selection['mode'] == 'catalog_auto' or selection['confirmation'] in ('timeout_default', 'user_delegated')
+    if model_chosen and monochrome and not resolved.get('monochrome_reason'):
+        raise ValueError('A style the model picks should be drawn and coloured: prefer ' + ', '.join(sorted(DRAWN_STYLES - MONOCHROME_STYLES, key=float))
+                         + '; black-and-white style 1 needs monochrome_reason: why this content must stay uncoloured')
+    return {'mode': selection['mode'], 'name': resolved['style_name'], 'resolved_sha256': digest(resolved_path), 'drawing_mode': drawing_mode}
 
 
 def serve_picker(job, source, port=0):
@@ -173,8 +240,8 @@ def serve_picker(job, source, port=0):
     while not (job / 'style/selection.json').is_file() and time.monotonic() < deadline:
         server.handle_request()
     if not (job / 'style/selection.json').is_file():
-        selection = {'mode':'catalog_auto', 'confirmation':'timeout_default',
-                     'evidence':'Optional style choice waited 60 seconds; model will match the content to the catalog'}
+        selection = {'mode':'inferred', 'confirmation':'timeout_default',
+                     'evidence':'Optional style choice waited 60 seconds; model infers style from content (list is non-binding)'}
         (job / 'style/selection.json').write_text(json.dumps(selection, ensure_ascii=False, indent=2))
     server.server_close()
     print('STYLE_SELECTION_SAVED=' + str(job / 'style/selection.json'), flush=True)

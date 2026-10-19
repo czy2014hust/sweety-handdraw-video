@@ -28,8 +28,8 @@ class StyleAndPlanTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def choose(self, mode, identity=None):
-        selection={'mode':mode,'confirmation':'explicit_user_request','evidence':'Isolated test selection'}
+    def choose(self, mode, identity=None, confirmation='explicit_user_request'):
+        selection={'mode':mode,'confirmation':confirmation,'evidence':'Isolated test selection'}
         if mode=='catalog':
             selection['catalog_id']=identity
         if mode=='custom':
@@ -41,10 +41,14 @@ class StyleAndPlanTests(unittest.TestCase):
         if mode in ('catalog','catalog_auto'):
             entry=next(entry for entry in self.catalog['styles'] if entry['id']==identity)
             resolved.update(catalog_id=identity,recipe_sha256=entry['recipe_sha256'])
+            if 'drawing_mode' not in entry:
+                resolved['drawing_mode']='draw'
         if mode in ('catalog_auto','inferred'):
             resolved['content_fit']='Matches the explanation in this fixture'
         if mode=='custom':
             resolved['style_basis']=selection['user_description']
+        if mode in ('inferred','custom'):
+            resolved['drawing_mode']='draw'
         self.save_resolution(resolved)
         return resolved
 
@@ -55,6 +59,42 @@ class StyleAndPlanTests(unittest.TestCase):
         for mode in ('catalog','catalog_auto','inferred','custom'):
             self.choose(mode,'1' if mode in ('catalog','catalog_auto') else None)
             self.assertEqual(verify_style(self.root)['mode'],mode)
+
+    def test_drawing_mode_is_declared_and_follows_the_bundled_catalog(self):
+        resolved=self.choose('inferred')
+        del resolved['drawing_mode'];self.save_resolution(resolved)
+        with self.assertRaisesRegex(ValueError,'drawing_mode'):
+            verify_style(self.root)
+        bundled=prepare_catalog(self.root,Path(__file__).resolve().parents[1]/'dependencies/hand-drawn-styles')
+        modes={entry['id']:entry['drawing_mode'] for entry in bundled['styles']}
+        self.assertEqual((modes['1'],modes['20'],modes['11'],modes['13'],modes['9']),('draw','draw','reveal','reveal','reveal'))
+        self.catalog=bundled
+        # Clicking a card the picker labels as revealed is the user's informed choice.
+        resolved=self.choose('catalog','11','user_dialog')
+        self.assertEqual(verify_style(self.root)['drawing_mode'],'reveal')
+        resolved['drawing_mode']='draw';self.save_resolution(resolved)
+        with self.assertRaisesRegex(ValueError,'catalog value'):
+            verify_style(self.root)
+        self.choose('catalog_auto','17')
+        self.assertEqual(verify_style(self.root)['drawing_mode'],'draw')
+        # A model-picked style is drawn and coloured; black-and-white style 1 needs a reason, a user's own pick does not.
+        for mode,identity,confirmation in (('catalog_auto','1','explicit_user_request'),('catalog','1','timeout_default'),('catalog','1','user_delegated')):
+            resolved=self.choose(mode,identity,confirmation)
+            with self.assertRaisesRegex(ValueError,'monochrome_reason'):
+                verify_style(self.root)
+            resolved['monochrome_reason']='The user asked for an xkcd-like black line look';self.save_resolution(resolved)
+            self.assertEqual(verify_style(self.root)['drawing_mode'],'draw')
+        self.choose('catalog','1','user_dialog')
+        self.assertEqual(verify_style(self.root)['drawing_mode'],'draw')
+        # Every other route to reveal gives up drawing without the user knowing: it needs the user's own answer.
+        for mode,identity,confirmation in (('catalog_auto','11','user_dialog'),('catalog','11','timeout_default'),('catalog','11','explicit_user_request'),
+                                           ('inferred',None,'user_delegated'),('inferred',None,'explicit_user_request'),('custom',None,'user_dialog')):
+            resolved=self.choose(mode,identity,confirmation)
+            resolved['drawing_mode']='reveal';self.save_resolution(resolved)
+            with self.assertRaisesRegex(ValueError,'only the user may choose it'):
+                verify_style(self.root)
+            resolved['reveal_accepted']='User: keep the ink-wash look even though it is brushed in, not drawn';self.save_resolution(resolved)
+            self.assertEqual(verify_style(self.root)['drawing_mode'],'reveal')
 
     def test_inferred_and_custom_cannot_borrow_a_catalog_recipe(self):
         for mode in ('inferred','custom'):

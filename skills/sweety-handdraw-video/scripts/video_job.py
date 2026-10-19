@@ -1,15 +1,16 @@
 """Compile content-designed pages against measured narration, not fixed scene lengths."""
 from pathlib import Path
-import glob
+import copy
 import hashlib
 import json
 import math
 import re
 import shutil
 import subprocess
+import sys
 import wave
 import numpy as np
-from PIL import Image, ImageFont
+from PIL import Image
 import stroke_assets
 from hand_assets import prepare_hand
 from art_direction import verify_art_direction
@@ -17,6 +18,9 @@ from caption_assets import build_caption, resolve_cues
 from watermark_assets import prepare_watermark
 from narration_master import load_master
 from audio_contract import resolve_audio_layers, validate_ending
+from fonts import check_coverage, select as select_font
+from storyboard_lint import anchor_beat, check_build, group_beats
+from timeline_contract import validate_page_motion
 
 PACKAGE = Path(__file__).resolve().parents[1]
 SAMPLE_RATE = 48000
@@ -36,56 +40,69 @@ def resolve_input(job_directory, value):
 
 
 def find_font(manifest):
-    configured = manifest.get('font', {})
-    if configured.get('path'):
-        path = Path(configured['path']).expanduser()
-        if not path.is_file():
-            raise FileNotFoundError(f'Configured font is missing: {path}')
-        return str(path.resolve()), int(configured.get('index', 0))
-    candidates = [(path, 2) for path in glob.glob('/System/Library/AssetsV2/com_apple_MobileAsset_Font8/*/AssetData/Hannotate.ttc')]
-    candidates += [('/System/Library/Fonts/Hiragino Sans GB.ttc', 0),
-                   ('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', 0)]
-    for path, index in candidates:
-        if Path(path).is_file():
-            return path, index
-    raise FileNotFoundError('No Chinese font found; set font.path and font.index in job.json')
+    """Handwriting font: job.json font.path/index, else the first covering font of the platform chain (see fonts.py)."""
+    return select_font('handwriting', '', manifest.get('font'))
+
+
+def fix_commands(report):
+    """One actionable line per missing item; image generation is a host capability scripts cannot detect."""
+    mac = sys.platform == 'darwin'
+    fixes = []
+    if not all(report['tools'].values()):
+        fixes.append('FFmpeg: ' + ('brew install ffmpeg' if mac else 'sudo apt install ffmpeg  (dnf install ffmpeg-free / pacman -S ffmpeg)') + '; or bash scripts/setup.sh')
+    if 'font_error' in report:
+        fixes.append('Fonts: ' + ('install Hannotate SC in Font Book (or set font.path in job.json)' if mac else
+                     'sudo apt install fonts-noto-cjk fontconfig  (dnf install google-noto-sans-cjk-fonts / pacman -S noto-fonts-cjk)')
+                     + '; run python3 scripts/fonts.py JOB to see every font tried')
+    if report['missing_inputs']:
+        fixes.append('Inputs: create or fix these job paths: ' + ', '.join(str(value) for value in report['missing_inputs']))
+    if 'art_direction_error' in report:
+        fixes.append('Art direction: record and bind the brief/prompt/review for every image (references/style-and-drawing.md)')
+    if not report['narration_files_available']:
+        fixes.append('Narration: start the local VoiceStudio service (http://127.0.0.1:3900) then python3 scripts/voice_studio.py JOB; '
+                     'or set voxcpm.model_path and run python3 scripts/voxcpm_voice.py JOB with the MLX Python; '
+                     'or, only with the user\'s own key, volcengine_tts.py / gemini_tts.py; '
+                     'or supply narration.source + alignment (references/continuous-narration.md)')
+    fixes.append('Images: Codex has built-in image generation; Claude Code needs an image-generation tool/MCP or user-provided images. '
+                 'Scripts cannot detect this; without it, stop instead of producing a text-only film.')
+    return fixes
 
 
 def inspect_environment(job_directory):
     root, manifest = load_manifest(job_directory)
-    report = {'tools': {name: shutil.which(name) for name in ('ffmpeg', 'ffprobe')}, 'missing_inputs': []}
+    report = {'python': sys.version.split()[0], 'tools': {name: shutil.which(name) for name in ('ffmpeg', 'ffprobe')}, 'missing_inputs': []}
     try:
-        report['font'] = find_font(manifest)
+        report['fonts'] = check_coverage(copy.deepcopy(manifest))
+        report['font'] = (report['fonts']['handwriting']['path'], report['fonts']['handwriting']['index'])
     except (ValueError, FileNotFoundError) as error:
         report['font_error'] = str(error)
     inputs = [manifest.get('cover', {}).get('source')]
+    audio = [manifest['narration'].get(key) for key in ('source', 'alignment')] if manifest.get('narration') else []
     for page in manifest['pages']:
         for beat in page['beats']:
             if not manifest.get('narration'):
-                inputs.append(beat.get('audio'))
+                audio.append(beat.get('audio'))
             inputs.extend(action.get('source') for action in beat.get('actions',[]) if action['type'] == 'illustration')
-    if manifest.get('narration'):
-        inputs.extend(manifest['narration'].get(key) for key in ('source', 'alignment'))
     for page in manifest['pages']:
         for group in page.get('visual_groups', []):
             inputs.extend(action.get('source') for action in group['actions'] if action['type']=='illustration')
     if manifest.get('hand', {}).get('source'):
         inputs.append(manifest['hand']['source'])
-    for value in inputs:
+    for value in inputs + audio:
         if not value or not resolve_input(root, value).is_file():
             report['missing_inputs'].append(value)
+    visuals_missing = any(not value or not resolve_input(root, value).is_file() for value in inputs)
     try:
         report['art_direction']=verify_art_direction(root,manifest)
     except (ValueError,FileNotFoundError,KeyError) as error:
         report['art_direction_error']=str(error)
     if not manifest.get('runtime_fixture'):
-        try:
-            import requests
-            response=requests.get(manifest.get('voice_studio',{}).get('url','http://127.0.0.1:3900')+'/engines/tts',timeout=5)
-            response.raise_for_status()
-            report['voice_studio']={'available':True,'active':response.json().get('active')}
-        except Exception as error:
-            report['voice_studio']={'available':False,'message':'VoiceStudio 未安装、未启动或不可达；无法生成旁白，请先安装并启动。'}
+        from voice_backends import voice_backends_report
+        backends = voice_backends_report(manifest.get('voice_studio', {}).get('url', 'http://127.0.0.1:3900'))
+        model = manifest.get('voxcpm', {}).get('model_path')
+        if model and (Path(model).expanduser()/'config.json').is_file():
+            backends['local_voxcpm2'].update(model=str(Path(model).expanduser()), available=bool(backends['local_voxcpm2']['python']))
+        report['voice_backends'] = backends
     report['narration_files_available'] = all(beat.get('audio') and resolve_input(root,beat['audio']).is_file()
         for page in manifest['pages'] for beat in page['beats'])
     if manifest.get('narration'):
@@ -98,8 +115,15 @@ def inspect_environment(job_directory):
     elif not manifest.get('runtime_fixture'):
         report['narration_error'] = 'Production requires a complete narration master and alignment'
         report['narration_files_available'] = False
-    report['ready'] = all(report['tools'].values()) and not report['missing_inputs'] and 'font_error' not in report and 'art_direction_error' not in report and report['narration_files_available']
-
+    renderable = all(report['tools'].values()) and not visuals_missing and 'font_error' not in report and 'art_direction_error' not in report
+    report['ready'] = renderable and not report['missing_inputs'] and report['narration_files_available']
+    report['capabilities'] = {
+        'render': renderable,
+        'generate_narration': bool(report.get('voice_backends') and (report['voice_backends']['local_voxcpm2']['available'] or report['voice_backends']['voice_studio']['reachable']
+                                                                     or any(report['voice_backends']['cloud_optional'].values()))),
+        'narration_ready': report['narration_files_available'],
+        'generate_images': 'host-dependent: not detectable by scripts'}
+    report['fixes'] = fix_commands(report)
     return report
 
 
@@ -136,6 +160,15 @@ def subtitle_time(seconds):
     return f'{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}'
 
 
+def drawn_seconds(metadata, seconds):
+    """How long an asset actually draws: pictures and stroke-order text stop at video pace, others use their window."""
+    if metadata.get('type') == 'illustration':
+        return float(metadata['seconds'])
+    if metadata.get('handwriting', {}).get('mode') == 'stroke_order':
+        return float(metadata['handwriting']['seconds'])
+    return seconds
+
+
 class FilmBuilder:
     def __init__(self, job_directory):
         self.root, self.manifest = load_manifest(job_directory)
@@ -144,19 +177,50 @@ class FilmBuilder:
         self.output = self.root / 'outputs'
         for directory in (self.work / 'assets', self.work / 'audio', self.work / 'review', self.output):
             directory.mkdir(parents=True, exist_ok=True)
+        for stale in (self.work / 'assets').glob('element-*'):
+            stale.unlink()  # assets are renumbered every build; a leftover layer file would attach to whatever now has its name
         canvas = self.manifest.get('canvas', {})
-        self.width = int(canvas.get('width', 1920))
-        self.height = int(canvas.get('height', 1080))
-        self.fps = int(canvas.get('fps', 30))
+        if not canvas.get('width') or not canvas.get('height'):
+            from aspect_ratio import resolve_canvas, DEFAULT_RATIO
+            resolved = resolve_canvas(canvas.get('aspect_ratio', DEFAULT_RATIO), canvas.get('width'), canvas.get('height'), canvas.get('fps', 30))
+            self.width, self.height, self.fps = resolved['width'], resolved['height'], resolved['fps']
+            self.aspect_ratio = resolved['aspect_ratio']
+        else:
+            self.width = int(canvas['width'])
+            self.height = int(canvas['height'])
+            self.fps = int(canvas.get('fps', 30))
+            self.aspect_ratio = canvas.get('aspect_ratio')
         if self.width < 320 or self.height < 240 or self.width % 2 or self.height % 2 or not 1 <= self.fps <= 60:
             raise ValueError('Canvas requires even width/height >=320x240 and fps within 1..60')
+        self.fonts = check_coverage(self.manifest)  # every rendered character must have a glyph; pins role fonts
         self.font_path, self.font_index = find_font(self.manifest)
-        stroke_assets.configure_assets(self.work / 'assets', self.font_path, self.font_index)
+        stroke_assets.configure_assets(self.work / 'assets', self.font_path, self.font_index, self.fps)
         self.assets = {}
         self.next_asset = 0
         self.seen_beat_ids = set()
 
-    def create_asset(self, action):
+    @staticmethod
+    def action_weight(action):
+        weight = float(action.get('weight', 3 if action['type'] == 'illustration' else 1))
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError('Action weight must be finite and positive')
+        return weight
+
+    @staticmethod
+    def minimum_seconds(action):
+        # Readers need about 0.3 s per hanzi to see the stroke order; Latin and punctuation write faster.
+        if action['type'] != 'text':
+            return 0.
+        return sum(.3 if '\u3400' <= character <= '\u9fff' else .12 for character in str(action['text']))
+
+    @staticmethod
+    def travel_gap(first, second, minimum):
+        # Lift-and-move time grows with distance so the pen never teleports between elements.
+        anchors = [np.array([float(spec['x']) + float(spec.get('width', spec.get('size', 60))) / 2,
+                             float(spec['y']) + float(spec.get('height', spec.get('size', 60))) / 2]) for spec in (first, second)]
+        return float(np.clip(np.linalg.norm(anchors[1] - anchors[0]) / 1600, max(minimum, .12), .45))
+
+    def create_asset(self, action, seconds=None):
         self.next_asset += 1
         name = f'element-{self.next_asset:04d}'
         kind = action['type']
@@ -164,23 +228,27 @@ class FilmBuilder:
             text = str(action['text'])
             if not text.strip() or '\n' in text:
                 raise ValueError('Each text action must contain one nonempty line')
-            metadata = stroke_assets.build_text(name, text, int(action.get('size', 60)), action.get('color', '#302C26'))
+            metadata = stroke_assets.build_text(name, text, int(action.get('size', 60)), action.get('color', '#302C26'), seconds=seconds,
+                                                stroke_order=bool(action.get('stroke_order', True)))
         elif kind == 'marker':
             metadata = stroke_assets.build_brush(name, int(action['width']), int(action['height']),
-                action.get('color', '#EAC958'), action.get('style', 'highlight'), action.get('line_width'))
+                action.get('color', '#EAC958'), action.get('style', 'highlight'), action.get('line_width'), seconds=seconds)
         elif kind == 'illustration':
             source = resolve_input(self.root, action['source'])
-            metadata = stroke_assets.build_illustration(name, source, int(action['width']), int(action['height']), action.get('crop'),action.get('parts'),resolve_input(self.root,action['outline_mask']) if action.get('outline_mask') else None)
+            optional = lambda key: resolve_input(self.root, action[key]) if action.get(key) else None
+            drawing = {**self.manifest.get('drawing', {}), **action.get('drawing', {})}
+            if drawing.get('mode') == 'reveal' and self.art_direction.get('style', {}).get('drawing_mode') == 'draw':
+                raise ValueError(f'{action["source"]}: this film is drawn; one picture cannot switch to reveal. Simplify or regenerate it so it can be drawn')
+            metadata = stroke_assets.build_illustration(name, source, int(action['width']), int(action['height']), action.get('crop'), action.get('parts'),
+                optional('outline_mask'), seconds=seconds, region_map_path=optional('region_map'), part_regions=action.get('part_regions'),
+                lineart_exception=action.get('lineart_exception'), drawing=drawing)
         else:
             raise ValueError(f'Unsupported action type: {kind}')
         self.assets[name] = metadata
         x, y = int(action['x']), int(action['y'])
         if not (0 <= x and 0 <= y and x + metadata['width'] <= self.width and y + metadata['height'] <= self.height):
             raise ValueError(f'Element is outside canvas: {action}')
-        weight = float(action.get('weight', 3 if kind == 'illustration' else 1))
-        if not math.isfinite(weight) or weight <= 0:
-            raise ValueError('Action weight must be finite and positive')
-        return {'asset': name, 'x': x, 'y': y, 'weight': weight,
+        return {'asset': name, 'x': x, 'y': y, 'weight': self.action_weight(action),
                 'z': int(action.get('z', 10 if kind == 'marker' and action.get('style', 'highlight') == 'highlight' else 30)),
                 'role': kind}
 
@@ -218,7 +286,8 @@ class FilmBuilder:
         for page_index, page_spec in enumerate(self.manifest['pages']):
             if not page_spec.get('beats'):
                 raise ValueError('Each page requires narration beats')
-            page = {'index': page_index, 'start': cursor, 'beats': [], 'events': []}
+            page = {'index': page_index, 'start': cursor, 'beats': [], 'events': [],
+                    'camera': page_spec.get('camera'), 'transition': page_spec.get('transition')}
             for beat_index, beat_spec in enumerate(page_spec['beats']):
                 beat_id = beat_spec.get('id', f'p{page_index:02d}-b{beat_index:02d}')
                 if not re.fullmatch(r'[A-Za-z0-9_-]+', beat_id) or beat_id in self.seen_beat_ids:
@@ -237,21 +306,8 @@ class FilmBuilder:
                 beat = {'id': beat_id, 'start': cursor, 'end': cursor + duration, 'duration': duration, 'text': beat_spec['text']}
                 if not str(beat['text']).strip():
                     raise ValueError('Narration text cannot be empty')
-                actions = [self.create_asset(action) for action in beat_spec.get('actions',[])]
-                if not actions and not page_spec.get('visual_groups'):
+                if not beat_spec.get('actions') and not page_spec.get('visual_groups'):
                     raise ValueError('Every beat needs actions or a page visual group')
-                lead = .54
-                hold = max(.5, duration * .13)
-                gap = .07
-                budget = duration - lead - hold - gap * max(0, len(actions) - 1)
-                if actions and budget < .15 * len(actions):
-                    raise ValueError(f'{beat_id}: too many drawing actions for the measured narration; simplify or regroup')
-                drawing_cursor = cursor + lead
-                for action in actions:
-                    drawing_seconds = budget * action['weight'] / sum(element['weight'] for element in actions)
-                    action.update(start=drawing_cursor, end=drawing_cursor + drawing_seconds, caption=False)
-                    drawing_cursor += drawing_seconds + gap
-                page['events'].extend(actions)
                 cue_source = aligned if master_report else beat_spec
                 if cue_source.get('caption_cues'):
                     beat['caption_cues'] = cue_source['caption_cues']
@@ -265,28 +321,58 @@ class FilmBuilder:
                     pause_samples = np.zeros(round(float(options.get('sentence_pause_seconds', .18)) * SAMPLE_RATE), dtype=np.int16)
                     pieces.append(pause_samples)
                     cursor += duration + len(pause_samples) / SAMPLE_RATE
-            if page_spec.get('visual_groups'):
-                for group in page_spec['visual_groups']:
-                    first_index=int(group['start_beat'])
-                    last_index=int(group.get('end_beat',first_index))
-                    if not 0<=first_index<=last_index<len(page['beats']):
-                        raise ValueError('Visual group beat indices must form an ordered range inside this page')
-                    first,last=page['beats'][first_index],page['beats'][last_index]
-                    lead,hold=float(group.get('lead',.54)),float(group.get('hold',.6))
-                    if not math.isfinite(lead+hold) or lead<0 or hold<.45:
-                        raise ValueError('Visual group needs a nonnegative lead and at least 0.45s reading hold')
-                    start = first['start'] + lead
-                    end = last['end'] - hold
-                    group_actions = [self.create_asset(action) for action in group['actions']]
-                    budget = end-start-.08*(len(group_actions)-1)
-                    if not group_actions or budget < .15*len(group_actions):
-                        raise ValueError('Visual group has no usable drawing time')
-                    total_weight=sum(action['weight'] for action in group_actions)
-                    for action in group_actions:
-                        duration=budget*action['weight']/total_weight
-                        action.update(start=start,end=start+duration,caption=False)
-                        page['events'].append(action)
-                        start+=duration+.08
+            ids = [beat['id'] for beat in page['beats']]
+            blocks = [(beat['start'] + .54, beat['end'] - max(.5, beat['duration'] * .13), .07, spec['actions'], beat['id'])
+                      for spec, beat in zip(page_spec['beats'], page['beats']) if spec.get('actions')]
+            for group in page_spec.get('visual_groups', []):
+                covered = group_beats(ids, group)
+                lead, hold = float(group.get('lead', .54)), float(group.get('hold', .6))
+                if not math.isfinite(lead + hold) or lead < 0 or hold < .45:
+                    raise ValueError('Visual group needs a nonnegative lead and at least 0.45s reading hold')
+                if not group.get('actions'):
+                    raise ValueError('Visual group has no actions')
+                # A group keeps drawing across sentences; an action with from_beat starts when its sentence starts.
+                start, end, current = page['beats'][ids.index(covered[0])]['start'] + lead, page['beats'][ids.index(covered[-1])]['end'] - hold, []
+                for spec in group['actions']:
+                    anchor = page['beats'][ids.index(anchor_beat(covered, ids, spec))]['start']
+                    if current and spec.get('from_beat') is not None:
+                        if anchor - .08 <= start:
+                            raise ValueError('from_beat must name a sentence after the earlier actions of its visual group have started')
+                        blocks.append((start, anchor - .08, .08, current, f'visual group {covered[0]}..{covered[-1]}'))
+                        start, current = anchor, []
+                    start = max(start, anchor)
+                    current.append(spec)
+                blocks.append((start, end, .08, current, f'visual group {covered[0]}..{covered[-1]}'))
+            blocks.sort(key=lambda block: block[0])
+            for (_, previous_end, _, _, previous), (start, _, _, _, label) in zip(blocks, blocks[1:]):
+                if start < previous_end:
+                    raise ValueError(f'{label} starts drawing while {previous} is still drawing (one pen); '
+                                     'put both in one visual group and use "from_beat" to start an action with its sentence')
+            for start, end, gap, specs, label in blocks:
+                gaps = [self.travel_gap(first, second, gap) for first, second in zip(specs, specs[1:])] + [0.]
+                floors = [self.minimum_seconds(spec) for spec in specs]
+                available = end - start - sum(gaps)
+                if available < .15 * len(specs):
+                    raise ValueError(f'{label}: too many drawing actions for the measured narration; simplify or extend the window across beats with a visual group')
+                if available - sum(floors) < .15 * len(specs):
+                    # Readable writing time is preferred, not guaranteed: shrink it and say so.
+                    print(f'WARNING {label}: text needs {sum(floors):.2f}s to show stroke order but only {available:.2f}s exist; '
+                          'shorten the text or widen the window', file=sys.stderr)
+                    floors = [floor * (available - .15 * len(specs)) / sum(floors) for floor in floors]
+                weights = [self.action_weight(spec) for spec in specs]
+                for index, (spec, floor, travel) in enumerate(zip(specs, floors, gaps)):
+                    # Each action may take its weighted share of the time still left. Assets are built after scheduling,
+                    # draw at video pace and hand unused time back: later actions may use it, the rest holds the picture.
+                    left = end - start - sum(gaps[index:]) - sum(floors[index:])
+                    seconds = floor + max(0., left) * weights[index] / sum(weights[index:])
+                    action = self.create_asset(spec, seconds)
+                    seconds = min(seconds, drawn_seconds(self.assets[action['asset']], seconds))
+                    action.update(start=start, end=start + seconds, caption=False, visual=spec.get('visual'))
+                    if spec['type'] == 'illustration':
+                        action['image'] = [spec['source'], spec.get('crop')]
+                    page['events'].append(action)
+                    start += seconds + travel
+            validate_page_motion(page, {'width': self.width, 'height': self.height}, first=page_index == 0)
             page['speech_end'] = page['beats'][-1]['end']
             pause = float(options.get('page_pause_seconds', .24)) if page_index < len(self.manifest['pages']) - 1 else float(options.get('end_hold_seconds', .45))
             if pause < 0:
@@ -327,11 +413,16 @@ class FilmBuilder:
         ending_review = validate_ending(self.manifest, master_samples, SAMPLE_RATE) if master_report and not self.manifest.get('runtime_fixture') else None
         narration = np.concatenate(pieces)
         save_wave(self.work / 'narration.wav', narration)
+        # Check cue timing on the clean narration now, not after a render: a late cue costs only a re-alignment here.
+        from align import caption_sync
+        sync = caption_sync(narration, cues)
+        if sync['status'] == 'FAIL' and not self.manifest.get('runtime_fixture'):
+            raise ValueError('Captions start away from the speech; fix the alignment before rendering: ' + json.dumps(sync['outside_tolerance'], ensure_ascii=False))
         hand = self.manifest.get('hand', {})
         timeline = {'title': self.manifest['title'], 'source_notes': self.manifest.get('source_notes', []),
-                    'canvas': {'width': self.width, 'height': self.height, 'fps': self.fps},
+                    'canvas': {'width': self.width, 'height': self.height, 'fps': self.fps, **({'aspect_ratio': self.aspect_ratio} if getattr(self, 'aspect_ratio', None) else {})},
                     'paper': self.manifest.get('paper', '#FBF9F1'), 'cover_seconds': cover_seconds, 'ending': {'fade_seconds': fade, 'caption_hold_seconds': caption_hold},
-                    'narration_master': master_report,
+                    'narration_master': master_report, 'caption_sync': sync,
                     'captions': {'presentation': 'burned', 'owner': 'caption_events'},
                     'audio_policy': resolve_audio_layers(self.root, self.manifest), 'ending_review': ending_review,
                     'duration': len(narration) / SAMPLE_RATE, 'pages': pages, 'cues': cues, 'audio_report': audio_report,
@@ -340,8 +431,10 @@ class FilmBuilder:
                     'watermark': prepare_watermark(self.manifest.get('watermark'), self.work, self.width, self.height),
                     'art_direction': self.art_direction,
                     'manifest_sha256': hashlib.sha256((self.root / 'job.json').read_bytes()).hexdigest()}
-        from subtitle_contract import validate_subtitles
+        from subtitle_contract import caption_clearance, validate_subtitles
         validate_subtitles(timeline)
+        caption_clearance(timeline, self.work / 'assets')
+        timeline['storyboard'] = check_build(self.root, self.manifest, timeline)
         cover = Image.open(resolve_input(self.root, self.manifest['cover']['source'])).convert('RGB')
         if abs(cover.width / cover.height - self.width / self.height) > .025:
             raise ValueError('Cover aspect ratio differs from canvas; generate or intentionally crop an appropriate cover')
@@ -354,5 +447,6 @@ class FilmBuilder:
             legacy.replace(editing / 'previous-captions.srt')
         (editing / 'transcript.srt').write_text('\n'.join(f"{index + 1}\n{subtitle_time(cue['start'])} --> {subtitle_time(cue['end'])}\n{cue['text']}\n" for index, cue in enumerate(cues)))
         (self.output / 'script.txt').write_text(self.manifest['title'] + '\n\n' + '\n\n'.join(cue['text'] for cue in cues))
-        print(json.dumps({'duration_seconds': timeline['duration'], 'pages': len(pages), 'beats': len(cues), 'drawn_assets': len(self.assets)}, ensure_ascii=False))
+        print(json.dumps({'duration_seconds': timeline['duration'], 'pages': len(pages), 'beats': len(cues), 'drawn_assets': len(self.assets),
+                          'storyboard': timeline['storyboard']['stats'], 'warnings': timeline['storyboard']['warnings']}, ensure_ascii=False))
         return timeline

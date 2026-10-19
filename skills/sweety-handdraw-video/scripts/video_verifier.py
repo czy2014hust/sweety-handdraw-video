@@ -5,8 +5,13 @@ import json
 import math
 import re
 import subprocess
+from datetime import datetime
 import numpy as np
 from PIL import Image
+from motion_profile import distance_fraction
+
+REVIEW_CATEGORIES = ('content', 'visual', 'motion', 'audio', 'privacy')
+PLAYBACK_CHECKS = ('continuous_playback', 'listening')
 
 
 def file_hash(path):
@@ -32,7 +37,7 @@ def build_fingerprint(root):
         from drawing_contract import illustration_actions
         plan_path = root/manifest['drawing_plan']
         paths.extend([root/'style/catalog.json',root/'style/selection.json',root/'style/resolved.json',plan_path,plan_path.with_suffix('.preflight.json'),root/manifest['drawing_review']])
-        paths.extend((root/action['outline_mask']).resolve() for action in illustration_actions(manifest) if action.get('outline_mask'))
+        paths.extend((root/action[key]).resolve() for action in illustration_actions(manifest) for key in ('outline_mask', 'region_map') if action.get(key))
     if timeline.get('narration_master'):
         from narration_master import verify_compiled_master
         verify_compiled_master(root, timeline)
@@ -44,6 +49,7 @@ def build_fingerprint(root):
     paths.extend(Path(clip['source']) for clip in timeline['audio_report'])
     for name in sorted(timeline['assets']):
         paths.extend(root / 'work' / 'assets' / f'{name}.{extension}' for extension in ('png', 'npz'))
+        paths.extend(sorted((root / 'work' / 'assets').glob(f'{name}-*.png')))
         if timeline['assets'][name].get('font'):
             paths.append(Path(timeline['assets'][name]['font']['path']))
         if timeline['assets'][name].get('source'):
@@ -52,6 +58,18 @@ def build_fingerprint(root):
     for path in paths:
         digest.update(file_hash(path).encode())
     return digest.hexdigest()
+
+
+def engine_identity():
+    """Version and a short digest of the scripts for the verification record: two hosts can compare
+    these to tell which skill build produced a job without shipping whole directories around."""
+    scripts = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(scripts.glob('*.py')):
+        digest.update(file_hash(path).encode())
+    stamp = scripts.parent / 'VERSION'
+    return {'version': stamp.read_text().strip() if stamp.is_file() else 'unknown',
+            'scripts_sha256': digest.hexdigest()[:16]}
 
 
 def match_reveal_to_tip(metadata, reveal, mask, kinds):
@@ -67,7 +85,8 @@ def match_reveal_to_tip(metadata, reveal, mask, kinds):
             continue
         points = np.array(segment['points'])
         lengths = np.array(segment['lengths'])
-        along = np.clip((timestamps[selected] - segment['start']) / max(1e-8, segment['end'] - segment['start']), 0, 1) * lengths[-1]
+        along = distance_fraction(np.clip((timestamps[selected] - segment['start']) / max(1e-8, segment['end'] - segment['start']), 0, 1),
+                                  segment.get('profile', 'linear')) * lengths[-1]
         separation = np.hypot(xs[selected] - np.interp(along, lengths, points[:, 0]), ys[selected] - np.interp(along, lengths, points[:, 1]))
         distances[selected] = np.minimum(distances[selected], separation)
         radii[selected] = np.maximum(radii[selected], segment.get('radius', 0))
@@ -97,30 +116,34 @@ def verify_assets(root, timeline):
         from drawing_contract import validate_strokes
         validate_strokes(metadata)
         if metadata['type'] == 'illustration':
-            require('owners' in maps and bool(metadata.get('parts')), f'{name}: missing semantic ownership')
+            require('owners' in maps and 'ink_owner' in maps and bool(metadata.get('parts')), f'{name}: missing semantic ownership; rebuild the asset')
             require((maps['owners'][alpha>0]>=0).all(), f'{name}: unowned illustration pixels')
             parts=metadata['parts']
-            require(max(part['outline_end'] for part in parts)<=min(part['fill_start'] for part in parts)+1e-6,
+            revealed = metadata.get('mode') == 'reveal'
+            entry['mode'] = 'reveal' if revealed else 'draw'
+            # A revealed picture has no outlines: "outlines before fill" does not apply, and is reported as such.
+            entry['outlines_before_fill'] = 'not_applicable' if revealed else 'pass'
+            require(revealed or max(part['outline_end'] for part in parts)<=min(part['fill_start'] for part in parts)+1e-6,
                     f'{name}: filling starts before all outlines are complete')
-            for phase,channel in [('outline','ink'),('fill','color')]:
+            # A stroke belongs wholly to one part (ink_owner); paint follows the pixel's part.
+            for phase,channel,owners in [('fill','color',maps['owners'])] if revealed else [('outline','ink',maps['ink_owner']),('fill','color',maps['owners'])]:
                 previous_end=0.
                 for index,part in enumerate(parts):
                     require(part[phase+'_start']>=previous_end-1e-6,f'{name}: semantic part order is broken')
                     previous_end=part[phase+'_end']
-                    selected=(alpha>0)&(maps['owners']==index)&np.isfinite(maps[channel])
-                    if selected.any():
-                        times=maps[channel][selected]
+                    times=maps[channel][(owners==index)&np.isfinite(maps[channel])]
+                    if times.size:
                         require(times.min()>=part[phase+'_start']-1e-6 and times.max()<=part[phase+'_end']+1e-6,
                                 f'{name}: pixels leak into another semantic part interval')
             entry['semantic_parts_in_order']=[part['id'] for part in parts]
-            ink_mask = (alpha > 0) & (maps['ink_weight'] > .01)
-            if ink_mask.any():
-                distances, _ = match_reveal_to_tip(metadata, maps['ink'], ink_mask, {'ink'})
+            drawn = np.isfinite(maps['ink'])
+            if drawn.any():
+                distances, _ = match_reveal_to_tip(metadata, maps['ink'], drawn, {'ink'})
                 require(np.isfinite(distances).all() and distances.max() < 9, f'{name}: ink is too far from the nib')
                 entry['ink_tip_max_distance_px'] = float(distances.max())
-            color_mask = (alpha > 0) & (maps['ink_weight'] < .99)
-            if color_mask.any():
-                distances, radii = match_reveal_to_tip(metadata, maps['color'], color_mask, {'color'})
+            painted = np.isfinite(maps['color'])
+            if painted.any():
+                distances, radii = match_reveal_to_tip(metadata, maps['color'], painted, {'color'})
                 require(np.isfinite(distances).all() and (radii > 0).all(), f'{name}: unpainted color pixels')
                 require((distances <= radii + .04).all(), f'{name}: color outside the active brush')
                 entry['paint_max_overshoot_px'] = float((distances - radii).max())
@@ -144,7 +167,9 @@ def verify_assets(root, timeline):
                         require(times.min()>=glyph['start']-1e-6 and times.max()<=glyph['end']+1e-6,
                                 f'{name}: a future character appears early')
                 entry['isolated_characters']=len(metadata['characters'])
-                require(distances.max() < 9, f'{name}: text is too far from the nib')
+                # Stroke-order glyphs reveal a whole brush width (up to ~0.13 em) around the median under the nib.
+                limit = max(9, .15 * metadata['font_size']) if metadata.get('handwriting', {}).get('mode') == 'stroke_order' else 9
+                require(distances.max() < limit, f'{name}: text is too far from the nib')
             else:
                 require((distances <= radii + .04).all(), f'{name}: marker outside the active brush')
             entry['maximum_tip_distance_px'] = float(distances.max())
@@ -158,7 +183,12 @@ def verify_job(job_directory, assets_only=False):
     timeline = json.loads((work / 'timeline.json').read_text())
     from art_direction import verify_art_direction
     art_review=verify_art_direction(root,json.loads((root/'job.json').read_text()))
-    report = {'duration_seconds': timeline['duration'], 'art_direction':art_review,'checks': {}, 'assets': verify_assets(root, timeline), 'pages': []}
+    report = {'duration_seconds': timeline['duration'], 'engine': engine_identity(), 'art_direction':art_review,'checks': {}, 'assets': verify_assets(root, timeline), 'pages': []}
+    pictures = [entry for entry in report['assets'] if entry['type'] == 'illustration']
+    report['pictures'] = {'drawn': sum(entry['mode'] == 'draw' for entry in pictures),
+                          'revealed': [entry['name'] for entry in pictures if entry['mode'] == 'reveal']}
+    require(not report['pictures']['revealed'] or art_review.get('style', {}).get('drawing_mode', 'reveal') == 'reveal',
+            'Revealed pictures in a drawn film: ' + ', '.join(report['pictures']['revealed']))
     if assets_only:
         print(json.dumps({'assets_checked': len(report['assets'])}))
         return report
@@ -218,6 +248,10 @@ def verify_job(job_directory, assets_only=False):
         require(tail_correlation > .98, 'Encoding changed or cut the final spoken phrase')
         report['ending_review'] = {**tail,'final_phrase_encoding_correlation':tail_correlation}
     report['audio_track_correlation'] = audio_correlation
+    report.update(verify_film_audio(work, timeline, video, report['audio_mix']))
+    if 'FAIL' in (report['audio_gate']['status'], report['caption_sync']['status']) and not json.loads((root/'job.json').read_text()).get('runtime_fixture'):
+        (work / 'verification.json').write_text(json.dumps({**report, 'status': 'audio_failed'}, ensure_ascii=False, indent=2))
+        require(False, 'Film audio failed: ' + json.dumps({'gate': report['audio_gate'].get('failures'), 'late_captions': report['caption_sync'].get('outside_tolerance')}, ensure_ascii=False))
     report['loudness'] = json.loads(match.group())
     require(-20 < float(report['loudness']['input_i']) < -14, 'Loudness outside expected narration range')
     require(float(report['loudness']['input_tp']) < -1, 'True peak too high')
@@ -236,15 +270,27 @@ def verify_job(job_directory, assets_only=False):
     report.update(status='engineering_passed_review_required', video_sha256=file_hash(video), cover_sha256=file_hash(output / 'cover.png'),
                   build_fingerprint=render_record['build_fingerprint'], frames=video_stream.get('nb_frames'), bytes=int(metadata['format']['size']))
     report['checks'] = {'full_decode': True, 'complete_timeline': True, 'paths_and_paint_coverage': True,
-                        'narration_controls_drawing_time': True, 'canvas_bounds': True, 'subtitle_order': True, 'loudness': True, 'semantic_part_order':True, 'glyph_isolation':True, 'arm_continues_off_canvas':True, 'cover_half_second_still_and_fade':True, 'mandatory_art_direction':True}
+                        'narration_controls_drawing_time': True, 'canvas_bounds': True, 'subtitle_order': True, 'loudness': True, 'audio_gate': report['audio_gate']['status'], 'caption_sync': report['caption_sync']['status'], 'semantic_part_order':True, 'outlines_before_fill': 'not_applicable' if pictures and len(report['pictures']['revealed']) == len(pictures) else True, 'glyph_isolation':True, 'arm_continues_off_canvas':True, 'cover_half_second_still_and_fade':True, 'mandatory_art_direction':True}
     (work / 'verification.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
     review_path = root / 'review.json'
     if not review_path.exists():
         review = {'video_sha256': report['video_sha256'], **{category: {'status': 'not_checked', 'evidence': ''}
-                    for category in ('content', 'visual', 'motion', 'audio', 'privacy')}, 'limitations': []}
+                    for category in REVIEW_CATEGORIES + PLAYBACK_CHECKS}, 'limitations': []}
         review_path.write_text(json.dumps(review, ensure_ascii=False, indent=2))
     print(json.dumps({key: value for key, value in report.items() if key not in ('assets', 'pages')}, ensure_ascii=False, indent=2))
     return report
+
+
+def verify_film_audio(work, timeline, video, audio_mix):
+    """Noise gate on the delivered narration (the film track, or the narration stem when music was requested)
+    and caption sync: cues start within align.SYNC_TOLERANCE_SECONDS of measured speech onsets."""
+    from audio_gate import measure, decode
+    from align import caption_sync
+    film = decode(video)
+    narration_only = not audio_mix['layers']
+    return {'audio_gate': measure(film if narration_only else decode(work/'normalized-narration.wav'),
+                                  'outputs/film.mp4 audio' if narration_only else 'work/normalized-narration.wav'),
+            'caption_sync': caption_sync(film, timeline['cues'])}
 
 
 def finalize_job(job_directory):
@@ -253,19 +299,49 @@ def finalize_job(job_directory):
     review = json.loads((root / 'review.json').read_text())
     video_hash = file_hash(root / 'outputs' / 'film.mp4')
     require(not json.loads((root/'job.json').read_text()).get('runtime_fixture'), 'Runtime fixtures can never be delivered as finished films')
+    rejected = [entry['reason'] for entry in review.get('rejections', []) if entry['video_sha256'] == video_hash]
+    require(not rejected, 'The user rejected this video (' + '; '.join(rejected) + '); rework it and render a new version')
     require(report['status'] == 'engineering_passed_review_required', 'Engineering checks must pass first')
+    require(report.get('audio_gate', {}).get('status') == 'PASS' and report.get('caption_sync', {}).get('status') == 'PASS',
+            'Film audio gate and caption sync must pass; verify again with this version')
     require(report['video_sha256'] == review['video_sha256'] == video_hash, 'Review belongs to a different video')
     timeline = json.loads((root / 'work' / 'timeline.json').read_text())
     require(timeline['manifest_sha256'] == file_hash(root / 'job.json'), 'Manifest changed since build')
     require(report['build_fingerprint'] == build_fingerprint(root), 'Inputs changed since verification')
-    for category in ('content', 'visual', 'motion', 'audio', 'privacy'):
+    for category in REVIEW_CATEGORIES:
         decision = review.get(category, {})
         require(decision.get('status') == 'pass' and bool(decision.get('evidence', '').strip()), f'{category} review is incomplete or failed')
-    receipt = {'status': 'delivery_review_completed', 'engineering': report, 'review': review}
+    # Watching the whole film in a player and listening to it are their own checks: frames and ASR cannot stand in for
+    # them. Either may stay not_done (no player, no audio output) but then the receipt says so instead of "passed".
+    for check in PLAYBACK_CHECKS:
+        decision = review.get(check, {})
+        require(decision.get('status') in ('pass', 'not_done') and bool(decision.get('evidence', '').strip()),
+                f'{check}: record pass with what you watched/heard, or not_done with why; a failed {check} needs rework')
+    open_checks = [check for check in PLAYBACK_CHECKS if review[check]['status'] == 'not_done']
+    receipt = {'status': 'delivery_review_completed_with_open_checks' if open_checks else 'delivery_review_completed',
+               'open_checks': open_checks, 'engineering': report, 'review': review}
     (root / 'outputs' / 'verification.json').write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
     lines = ['交付检查记录', f"视频 SHA-256：{video_hash}", f"片长：{report['duration_seconds']:.3f}秒", '工程检查：通过']
-    for category in ('content', 'visual', 'motion', 'audio', 'privacy'):
+    for category in REVIEW_CATEGORIES:
         lines.append(f"{category}：{review[category]['evidence']}")
+    for check, label in zip(PLAYBACK_CHECKS, ('连续播放', '听音')):
+        lines.append(f"{label}：{'通过' if review[check]['status'] == 'pass' else '未完成'}，{review[check]['evidence']}")
     lines += ['未验证或限制：'] + (review.get('limitations') or ['未另行记录；不代表任意主题或平台均已验证。'])
     (root / 'outputs' / 'verification.txt').write_text('\n'.join(lines) + '\n')
+    print(str(root / 'outputs' / 'verification.txt'))
+
+
+def reject_job(job_directory, reason):
+    """The user's rejection outranks every recorded pass: it voids the receipt of the video they saw, and finalize
+    refuses that video until a reworked render replaces it."""
+    root = Path(job_directory).resolve()
+    require(bool(reason.strip()), 'Record what the user rejected and why')
+    video_hash = file_hash(root / 'outputs' / 'film.mp4')
+    review_path = root / 'review.json'
+    review = json.loads(review_path.read_text()) if review_path.exists() else {}
+    entry = {'video_sha256': video_hash, 'reason': reason.strip(), 'time': datetime.now().astimezone().isoformat(timespec='seconds')}
+    review.setdefault('rejections', []).append(entry)
+    review_path.write_text(json.dumps(review, ensure_ascii=False, indent=2))
+    (root / 'outputs' / 'verification.json').write_text(json.dumps({'status': 'rejected_by_user', **entry}, ensure_ascii=False, indent=2))
+    (root / 'outputs' / 'verification.txt').write_text(f"交付检查记录\n用户已拒绝，需要返工\n视频 SHA-256：{video_hash}\n原因：{entry['reason']}\n")
     print(str(root / 'outputs' / 'verification.txt'))

@@ -58,6 +58,8 @@ def verify_art_direction(root, manifest):
     from style_choice import verify_style
     from drawing_contract import verify_drawing_plans
     style_review = verify_style(root)
+    if manifest.get('drawing', {}).get('mode', 'draw') != style_review['drawing_mode']:
+        raise ValueError(f'job.json drawing.mode must follow the chosen style: set "drawing": {{"mode": "{style_review["drawing_mode"]}"}}')
     drawing_review = verify_drawing_plans(root, manifest, style_review)
     design_path=root/manifest.get('design_file','design.json')
     if not design_path.is_file():
@@ -68,6 +70,15 @@ def verify_art_direction(root, manifest):
         raise ValueError('Narrative route requires a model decision, reason and director review')
     if route['decision']!='default_life_concept' and not route.get('director_plan'):
         raise ValueError('A non-default narrative requires an omniailab director plan')
+    from presentation import validate_presentation
+    if not design.get('presentation'):
+        raise ValueError('design.json needs presentation.mode (picture_book|focus_diagram|dense_infographic|accumulating_board|step_sequence|narrative_comic) and reason — director density, not a user option')
+    presentation = validate_presentation(design['presentation'], 'design.json')
+    from composition import check_presentation_match
+    from storyboard_lint import load as load_storyboard
+    board = load_storyboard(root, manifest)
+    if board is not None:
+        check_presentation_match(presentation, board)
     dependency=PACKAGE/'dependencies/sweety-image-art-direction/GUIDE.md'
     if not dependency.is_file():
         raise ValueError('Mandatory sweety-image-art-direction dependency is missing')
@@ -84,7 +95,7 @@ def verify_art_direction(root, manifest):
         if profile is None:
             raise ValueError('Unknown hand preset: '+identity)
         count+=check_record(PACKAGE/'assets/hands/art-direction.json',[(PACKAGE/'assets/hands'/profile['source'],None)],dependency_hash)
-    return {'dependency_sha256':dependency_hash,'reviewed_image_uses':count, 'style':style_review, 'drawing_plan':drawing_review}
+    return {'dependency_sha256':dependency_hash,'reviewed_image_uses':count, 'style':style_review, 'drawing_plan':drawing_review, 'presentation':presentation}
 
 
 def bind_evidence(record_path):
